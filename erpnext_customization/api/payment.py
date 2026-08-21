@@ -347,10 +347,8 @@ def create_bank_payment_request(
             purchase_invoice.currency,
 
         "amount":
-            outstanding_amount,
+            outstanding_amount
 
-        "otp":
-            response.get("otp")
     }
 
 
