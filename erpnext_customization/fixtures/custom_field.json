@@ -36,7 +36,7 @@
   "link_filters": null,
   "mandatory_depends_on": null,
   "mask": 0,
-  "modified": "2026-08-17 16:19:45.341860",
+  "modified": "2026-08-19 17:55:35.620012",
   "module": "Erpnext Customization",
   "name": "Purchase Invoice-custom_payment_details",
   "no_copy": 0,

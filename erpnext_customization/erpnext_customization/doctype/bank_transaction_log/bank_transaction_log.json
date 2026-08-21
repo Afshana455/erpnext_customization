@@ -21,7 +21,8 @@
   "otp_status",
   "otp_verified_at",
   "bank_response_code",
-  "bank_response_message"
+  "bank_response_message",
+  "bank_response_timestamp"
  ],
  "fields": [
   {
@@ -37,7 +38,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Status",
-   "options": "Initiated\nOTP Verified\nProcessing\nCompleted\nFailed\nError",
+   "options": "Initiated\nPending\nCompleted\nFailed\nRejected\nError\nNot Found",
    "read_only": 1,
    "reqd": 1
   },
@@ -111,14 +112,14 @@
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Transaction ID",
-   "read_only": 1,
-   "reqd": 1
+   "read_only": 1
   },
   {
    "fieldname": "transaction_amount",
    "fieldtype": "Currency",
    "label": "Transaction Amount",
    "non_negative": 1,
+   "read_only": 1,
    "reqd": 1
   },
   {
@@ -130,12 +131,17 @@
    "fieldname": "bank_response_message",
    "fieldtype": "Small Text",
    "label": "Bank Response Message"
+  },
+  {
+   "fieldname": "bank_response_timestamp",
+   "fieldtype": "Datetime",
+   "label": "Bank Response Timestamp"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-08-14 09:40:48.958936",
+ "modified": "2026-08-20 12:48:48.476738",
  "modified_by": "Administrator",
  "module": "Erpnext Customization",
  "name": "Bank Transaction Log",

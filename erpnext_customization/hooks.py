@@ -264,3 +264,11 @@ fixtures = [
         ]
     }
 ]
+
+scheduler_events = {
+    "cron": {
+        "*/5 * * * *": [
+            "erpnext_customization.tasks.payment.sync_bank_payment_status"
+        ]
+    }
+}

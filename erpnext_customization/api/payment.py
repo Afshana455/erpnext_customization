@@ -1,348 +1,788 @@
-import requests
 import frappe
+import requests
+from frappe import _
+from frappe.utils import flt, now_datetime
 
-
-INTEGRATION_SITE = "http://bank_integration.site:8000"
-
+INTEGRATION_SITE = (
+    "http://bank_integration.site:8000"
+)
 
 def get_integration_headers():
-    credentials = frappe.get_single("Integration Site Keys")
+
+    credentials = frappe.get_single(
+        "Integration Site Keys"
+    )
 
     api_key = credentials.api_key
     api_secret = credentials.secret_key
 
     if not api_key or not api_secret:
-        frappe.throw("Integration API credentials are not configured.")
+        frappe.throw(
+            "Integration API credentials "
+            "are not configured."
+        )
 
     return {
-        "Authorization": f"token {api_key}:{api_secret}",
-        "Content-Type": "application/json"
+        "Authorization":
+            f"token {api_key}:{api_secret}",
+
+        "Content-Type":
+            "application/json",
+
+        "Accept":
+            "application/json"
     }
 
+def call_integration_api(
+    method,
+    payload
+):
 
-def call_integration_api(method, payload):
-    url = f"{INTEGRATION_SITE}/api/method/{method}"
+    url = (
+        f"{INTEGRATION_SITE}"
+        f"/api/method/{method}"
+    )
 
     try:
+
         response = requests.post(
             url,
             json=payload,
             headers=get_integration_headers(),
             timeout=15
         )
+
+    except requests.Timeout:
+
+        frappe.log_error(
+            title="Integration Timeout",
+            message=frappe.get_traceback()
+        )
+
+        frappe.throw(
+            "Bank integration site "
+            "did not respond in time."
+        )
+
     except requests.RequestException:
+
         frappe.log_error(
             title="Integration Connection Error",
             message=frappe.get_traceback()
         )
-        frappe.throw("Unable to connect to bank integration site.")
 
-    if response.status_code != 200:
+        frappe.throw(
+            "Unable to connect to "
+            "bank integration site."
+        )
+
+    if response.status_code not in (
+        200,
+        202
+    ):
         frappe.log_error(
             title="Integration API Error",
-            message=response.text
+            message=(
+                f"HTTP Status: "
+                f"{response.status_code}\n\n"
+                f"{response.text}"
+            )
         )
 
         try:
             error_data = response.json()
+
             error_message = (
                 error_data.get("message")
-                or error_data.get("exc_type")
                 or error_data.get("exception")
                 or response.text
             )
+
         except ValueError:
             error_message = response.text
 
         frappe.throw(
-            f"Bank integration site returned HTTP {response.status_code}: {error_message}"
+            "Bank integration site returned "
+            f"HTTP {response.status_code}: "
+            f"{error_message}"
         )
 
     try:
+
         result = response.json()
+
     except ValueError:
-        frappe.log_error(
-            title="Invalid Integration Response",
-            message=response.text
+
+        frappe.throw(
+            "Bank integration site returned "
+            "an invalid response."
         )
-        frappe.throw("Bank integration site returned an invalid response.")
 
     data = result.get("message")
 
-    if not data:
-        frappe.throw("Bank integration site returned an unexpected response.")
+    if not isinstance(data, dict):
+        frappe.throw(
+            "Bank integration site returned "
+            "invalid payment data."
+        )
 
     return data
 
 
 @frappe.whitelist()
-def initiate_bank_payment(invoice, amount, source_account,supplier_account, mode_of_payment):
-    if not invoice:
-        frappe.throw("Purchase Invoice is required.")
+def create_bank_payment_request(
+    invoice,
+    source_account,
+    supplier_account,
+    mode_of_payment
+):
 
-    if amount is None or amount == "":
-        frappe.throw("Payment amount is required.")
+    if not invoice:
+        frappe.throw(_("Purchase Invoice is required."))
 
     if not source_account:
-        frappe.throw("Company bank account is required.")
+        frappe.throw(_("Company bank account is required."))
+
     if not supplier_account:
-        frappe.throw("Supplier bank account is required.")
+        frappe.throw(_("Supplier bank account is required."))
 
     if not mode_of_payment:
-        frappe.throw("Mode of payment is required.")
+        frappe.throw(_("Mode of payment is required."))
 
-    try:
-        amount = float(amount)
-    except (TypeError, ValueError):
-        frappe.throw("Payment amount must be a valid number.")
-
-    if amount <= 0:
-        frappe.throw("Payment amount must be greater than zero.")
-
-    purchase_invoice = frappe.get_doc("Purchase Invoice", invoice)
+    purchase_invoice = frappe.get_doc(
+        "Purchase Invoice",
+        invoice
+    )
 
     if purchase_invoice.docstatus != 1:
-        frappe.throw("Payment can only be initiated for a submitted Purchase Invoice.")
+        frappe.throw(
+            _("Only submitted Purchase Invoices can be paid.")
+        )
 
-    outstanding_amount = float(purchase_invoice.outstanding_amount or 0)
+    # --------------------------------------------------------
+    # Calculate custom outstanding amount
+    # --------------------------------------------------------
+
+    completed_amount = 0
+
+    for row in (
+        purchase_invoice.custom_payment_details
+        or []
+    ):
+
+        if row.payment_status == "Completed":
+            completed_amount += flt(
+                row.amount
+            )
+
+    outstanding_amount = max(
+        flt(purchase_invoice.grand_total or 0)
+        - completed_amount,
+        0
+    )
 
     if outstanding_amount <= 0:
-        frappe.throw("This Purchase Invoice has no outstanding amount.")
-
-    if amount > outstanding_amount:
         frappe.throw(
-            f"Payment amount cannot exceed the outstanding amount of "
-            f"{purchase_invoice.currency} {outstanding_amount:.2f}."
+            _("This Purchase Invoice has no outstanding amount.")
         )
 
-    company_bank_account = frappe.db.get_value(
+    # --------------------------------------------------------
+    # Prevent multiple active payments
+    # --------------------------------------------------------
+
+    active_statuses = [
+        "OTP Pending",
+        "OTP Verified",
+        "Payment Initiated",
+        "Pending"
+    ]
+
+    for row in (
+        purchase_invoice.custom_payment_details
+        or []
+    ):
+
+        if row.payment_status in active_statuses:
+
+            frappe.throw(
+                _(
+                    "There is already an active payment "
+                    "request for this Purchase Invoice."
+                )
+            )
+
+    # --------------------------------------------------------
+    # Get supplier account number
+    # --------------------------------------------------------
+
+    supplier_account_number = frappe.db.get_value(
         "Bank Account",
-        {
-            "name": source_account,
-            "company": purchase_invoice.company,
-            "is_company_account": 1,
-            "disabled": 0
-        },
-        ["name", "bank_account_no", "account_name"],
-        as_dict=True
+        supplier_account,
+        "bank_account_no"
     )
 
-    if not company_bank_account:
-        frappe.throw(
-            "Selected company bank account is invalid or does not belong to this company."
-        )
+    if not supplier_account_number:
+        supplier_account_number = supplier_account
 
-    if not company_bank_account.bank_account_no:
-        frappe.throw("Selected company bank account does not have an account number.")
-    
-    supplier_bank_account = frappe.db.get_value("Bank Account",{ "name": supplier_account, "party_type": "Supplier", "party": purchase_invoice.supplier, "disabled": 0},[ "name", "bank_account_no", "account_name"], as_dict=True)
-    
-    if not supplier_bank_account:
-        frappe.throw(f"Selected bank account does not belong to supplier "
-        f"{purchase_invoice.supplier}.")
+    # --------------------------------------------------------
+    # Get company account number
+    # --------------------------------------------------------
 
-    if not supplier_bank_account.bank_account_no:
-        frappe.throw("Selected supplier bank account "
-         "does not have an account number.")
+    source_account_number = frappe.db.get_value(
+        "Bank Account",
+        source_account,
+        "bank_account_no"
+    )
 
-    request_id = frappe.generate_hash(length=20)
+    if not source_account_number:
+        source_account_number = source_account
 
-    payload = {
-        "request_id": request_id,
-        "erp_site": frappe.local.site,
-        "erp_doctype": "Purchase Invoice",
-        "erp_document_name": purchase_invoice.name,
-        "amount": amount,
-        "currency": purchase_invoice.currency,
-        "source_account": company_bank_account.bank_account_no,
-        "beneficiary_account": supplier_bank_account.bank_account_no,
-        "mode_of_payment": mode_of_payment
-    }
+    # --------------------------------------------------------
+    # Call bank integration
+    # --------------------------------------------------------
 
-    data = call_integration_api(
+    response = call_integration_api(
         "bank_integration.api.payment.create_payment_request",
-        payload
-    )
-
-    transaction_log = frappe.get_doc({
-        "doctype": "Bank Transaction Log",
-        "transaction_id": request_id,
-        "transaction_date": frappe.utils.now_datetime(),
-        "status": "Initiated",
-        "payment_request_id": data.get("request_id"),
-        "erp_site": frappe.local.site,
-        "erp_doctype": "Purchase Invoice",
-        "erp_document": purchase_invoice.name,
-        "invoice_amount": purchase_invoice.grand_total,
-        "transaction_amount": amount,
-        "currency": purchase_invoice.currency,
-        "mode_of_payment": mode_of_payment,
-        "otp_status": "Pending",
-        "bank_response_code": "",
-        "bank_response_message": ""
-    })
-
-    transaction_log.insert(ignore_permissions=True)
-
-    payment_row = purchase_invoice.append(
-        "custom_payment_details",
         {
-            "payment_id": data.get("request_id"),
-            "amount": amount,
-            "currency": purchase_invoice.currency,
-            "outsanding_amount": outstanding_amount,
-            "payment_status": "OTP Pending",
-            "payment_date": frappe.utils.now_datetime()
+            "erp_site":
+                frappe.local.site,
+
+            "erp_doctype":
+                "Purchase Invoice",
+
+            "erp_document_name":
+                purchase_invoice.name,
+
+            "currency":
+                purchase_invoice.currency,
+
+            "amount":
+                outstanding_amount,
+
+            "source_account":
+                source_account_number,
+
+            "beneficiary_account":
+                supplier_account_number,
+
+            "mode_of_payment":
+                mode_of_payment
         }
     )
 
-    purchase_invoice.save(ignore_permissions=True)
+    if not response:
+        frappe.throw(
+            _("No response received from bank integration.")
+        )
+
+    if not response.get("success"):
+        frappe.throw(
+            response.get(
+                "message",
+                _("Unable to create bank payment request.")
+            )
+        )
+
+    request_id = response.get(
+        "request_id"
+    )
+
+    if not request_id:
+        frappe.throw(
+            _("Bank integration did not return a request ID.")
+        )
+
+    # --------------------------------------------------------
+    # Add Payment Details row
+    # --------------------------------------------------------
+
+    payment_row = purchase_invoice.append(
+        "custom_payment_details",
+        {}
+    )
+
+    payment_row.payment_id = request_id
+
+    payment_row.amount = outstanding_amount
+
+    payment_row.currency = (
+        response.get("currency")
+        or purchase_invoice.currency
+    )
+
+    payment_row.outstanding_amount = (
+        outstanding_amount
+    )
+
+    payment_row.payment_date = (
+        now_datetime().date()
+    )
+
+    payment_row.payment_status = (
+        "OTP Pending"
+    )
+
+    purchase_invoice.save(
+        ignore_permissions=True
+    )
+
     frappe.db.commit()
 
     return {
         "success": True,
-        "request_id": data.get("request_id"),
-        "otp": data.get("otp"),
-        "otp_expires_at": data.get("otp_expires_at"),
-        "payment_status": data.get("payment_status", "Initiated"),
-        "transaction_log": transaction_log.name,
-        "payment_details_row": payment_row.name
+
+        "request_id":
+            request_id,
+
+        "supplier_account":
+            supplier_account_number,
+
+        "source_account":
+            source_account_number,
+
+        "mode_of_payment":
+            mode_of_payment,
+
+        "currency":
+            purchase_invoice.currency,
+
+        "amount":
+            outstanding_amount,
+
+        "otp":
+            response.get("otp")
     }
 
 
+# ============================================================
+# VERIFY OTP
+# ============================================================
+
 @frappe.whitelist()
-def validate_bank_payment_otp(invoice, payment_request, otp, transaction_log):
+def validate_bank_payment_otp(
+    invoice,
+    payment_request,
+    otp
+):
+
     if not invoice:
-        frappe.throw("Purchase Invoice is required.")
+        frappe.throw(
+            _("Purchase Invoice is required.")
+        )
 
     if not payment_request:
-        frappe.throw("Payment request is required.")
+        frappe.throw(
+            _("Payment request is required.")
+        )
 
     if not otp:
-        frappe.throw("OTP is required.")
+        frappe.throw(
+            _("OTP is required.")
+        )
 
-    if not transaction_log:
-        frappe.throw("Transaction log is required.")
+    response = call_integration_api(
+        "bank_integration.api.otp.validate_payment_otp",
+        {
+            "payment_request":
+                payment_request,
 
-    purchase_invoice = frappe.get_doc("Purchase Invoice", invoice)
+            "entered_otp":
+                otp
+        }
+    )
 
-    if purchase_invoice.docstatus != 1:
-        frappe.throw("Purchase Invoice must be submitted.")
+    if not response:
+        return {
+            "success": False,
+            "message":
+                _("No response from bank integration.")
+        }
 
-    log = frappe.get_doc("Bank Transaction Log", transaction_log)
+    # --------------------------------------------------------
+    # Update ERP Payment Details
+    # --------------------------------------------------------
 
-    if log.erp_document != purchase_invoice.name:
-        frappe.throw("Transaction log does not belong to this Purchase Invoice.")
-
-    if log.payment_request_id != payment_request:
-        frappe.throw("Payment request does not match the transaction log.")
+    purchase_invoice = frappe.get_doc(
+        "Purchase Invoice",
+        invoice
+    )
 
     payment_row = None
-    for row in (purchase_invoice.custom_payment_details or []):
+
+    for row in (
+        purchase_invoice.custom_payment_details
+        or []
+    ):
+
+        if row.payment_id == payment_request:
+            payment_row = row
+            break
+
+    if payment_row:
+
+        otp_status = response.get(
+            "otp_status"
+        )
+
+        if otp_status == "Verified":
+
+            payment_row.payment_status = (
+                "OTP Verified"
+            )
+
+        elif otp_status == "Invalid":
+
+            payment_row.payment_status = (
+                "OTP Pending"
+            )
+
+        purchase_invoice.save(
+            ignore_permissions=True
+        )
+
+    frappe.db.commit()
+
+    return response
+
+
+# ============================================================
+# SUBMIT BANK PAYMENT
+# ============================================================
+
+@frappe.whitelist()
+def submit_bank_payment(
+    invoice,
+    payment_request,
+    amount
+):
+
+    if not invoice:
+        frappe.throw(
+            _("Purchase Invoice is required.")
+        )
+
+    if not payment_request:
+        frappe.throw(
+            _("Payment request is required.")
+        )
+
+    amount = flt(amount)
+
+    if amount <= 0:
+        frappe.throw(
+            _("Payment amount must be greater than zero.")
+        )
+
+    purchase_invoice = frappe.get_doc(
+        "Purchase Invoice",
+        invoice
+    )
+
+    # --------------------------------------------------------
+    # Find Payment Details row
+    # --------------------------------------------------------
+
+    payment_row = None
+
+    for row in (
+        purchase_invoice.custom_payment_details
+        or []
+    ):
+
         if row.payment_id == payment_request:
             payment_row = row
             break
 
     if not payment_row:
-        frappe.throw("Payment Details row was not found for this payment request.")
+        frappe.throw(
+            _(
+                "Payment Details row not found for "
+                "payment request {0}."
+            ).format(payment_request)
+        )
 
-    data = call_integration_api(
-        "bank_integration.api.otp.validate_payment_otp",
+    if payment_row.payment_status != "OTP Verified":
+        frappe.throw(
+            _("OTP must be verified before submitting payment.")
+        )
+
+    # --------------------------------------------------------
+    # Validate outstanding amount
+    # --------------------------------------------------------
+
+    completed_amount = 0
+
+    for row in (
+        purchase_invoice.custom_payment_details
+        or []
+    ):
+
+        if row.payment_status == "Completed":
+            completed_amount += flt(
+                row.amount
+            )
+
+    outstanding_amount = max(
+        flt(purchase_invoice.grand_total or 0)
+        - completed_amount,
+        0
+    )
+
+    if amount > outstanding_amount:
+        frappe.throw(
+            _(
+                "Payment amount cannot exceed "
+                "the outstanding amount."
+            )
+        )
+
+    # --------------------------------------------------------
+    # Call bank integration
+    # --------------------------------------------------------
+
+    response = call_integration_api(
+        "bank_integration.api.payment.submit_payment_request",
         {
-            "payment_request": payment_request,
-            "entered_otp": str(otp)
+            "payment_request":
+                payment_request,
+
+            "amount":
+                amount
         }
     )
 
-    otp_status = data.get("otp_status")
-
-    valid_otp_statuses = {
-        "Pending",
-        "Verified",
-        "Invalid",
-        "Expired",
-        "Failed"
-    }
-
-    if otp_status not in valid_otp_statuses:
+    if not response:
         frappe.throw(
-            f"Unexpected OTP status received from bank integration site: {otp_status}"
+            _("No response received from bank integration.")
         )
 
-    log.otp_status = otp_status
-
-    if otp_status == "Invalid":
-        log.status = "Initiated"
-        payment_row.payment_status = "OTP Pending"
-        log.bank_response_code = ""
-        log.bank_response_message = ""
-
-    elif otp_status == "Expired":
-        log.status = "Failed"
-        payment_row.payment_status = "Failed"
-        log.bank_response_code = ""
-        log.bank_response_message = ""
-
-    elif otp_status == "Failed":
-        log.status = "Failed"
-        payment_row.payment_status = "Failed"
-        log.bank_response_code = ""
-        log.bank_response_message = ""
-
-    elif otp_status == "Pending":
-        log.status = "Initiated"
-        payment_row.payment_status = "OTP Pending"
-        log.bank_response_code = ""
-        log.bank_response_message = ""
-
-    elif otp_status == "Verified":
-        bank_payment_status = data.get("payment_status") or "Failed"
-
-        valid_payment_statuses = {
-            "Initiated",
-            "Pending",
-            "Completed",
-            "Failed",
-            "Rejected"
-        }
-
-        if bank_payment_status not in valid_payment_statuses:
-            frappe.throw(
-                f"Unexpected payment status received from bank integration site: {bank_payment_status}"
+    if not response.get("success"):
+        frappe.throw(
+            response.get(
+                "response_message",
+                response.get(
+                    "message",
+                    _("Bank payment submission failed.")
+                )
             )
+        )
 
-        payment_status_map = {
-            "Initiated": "Payment Initiated",
-            "Pending": "Pending",
-            "Completed": "Completed",
-            "Failed": "Failed",
-            "Rejected": "Rejected"
-        }
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Initially transaction_id = request ID.
+    #
+    # Scheduler will replace it with the real
+    # bank transaction ID later.
+    # --------------------------------------------------------
 
-        invoice_payment_status = payment_status_map.get(bank_payment_status, "Error")
+    transaction_id = payment_request
 
-        log.status = bank_payment_status
-        log.bank_response_code = data.get("response_code") or ""
-        log.bank_response_message = data.get("response_message") or ""
+    transaction_log = frappe.get_doc({
+        "doctype":
+            "Bank Transaction Log",
 
-        payment_row.payment_status = invoice_payment_status
+        "transaction_id":
+            transaction_id,
 
-    log.save(ignore_permissions=True)
-    purchase_invoice.save(ignore_permissions=True)
+        "transaction_date":
+            now_datetime(),
+
+        "status":
+            "Initiated",
+
+        "payment_request_id":
+            payment_request,
+
+        "erp_site":
+            frappe.local.site,
+
+        "erp_doctype":
+            "Purchase Invoice",
+
+        "erp_document":
+            purchase_invoice.name,
+
+        "invoice_amount":
+            flt(purchase_invoice.grand_total),
+
+        "transaction_amount":
+            amount,
+
+        "currency":
+            purchase_invoice.currency,
+
+        "mode_of_payment":
+            response.get(
+                "mode_of_payment"
+            ) or payment_row.get(
+                "mode_of_payment"
+            ) or "",
+
+        "otp_status":
+            "Verified",
+
+        "otp_verified_at":
+            response.get(
+                "otp_verified_at"
+            ),
+
+        "bank_response_code":
+            response.get(
+                "response_code"
+            ) or "",
+
+        "bank_response_message":
+            response.get(
+                "response_message"
+            ) or "",
+
+        "bank_response_timestamp":
+            response.get(
+                "response_timestamp"
+            )
+    })
+
+    transaction_log.insert(
+        ignore_permissions=True
+    )
+
+    # --------------------------------------------------------
+    # Update Payment Details
+    # --------------------------------------------------------
+
+    payment_row.amount = amount
+
+    payment_row.payment_status = "Pending"
+
+
+    payment_row.payment_date = (
+        now_datetime().date()
+    )
+
+    purchase_invoice.save(
+        ignore_permissions=True
+    )
+
     frappe.db.commit()
 
     return {
-        "success": data.get("success"),
-        "request_id": data.get("request_id", payment_request),
-        "otp_status": otp_status,
-        "payment_status": data.get("payment_status"),
-        "response_code": data.get("response_code"),
-        "response_message": data.get("response_message"),
-        "transaction_id": data.get("transaction_id"),
-        "debit_account_number": data.get("debit_account_number"),
-        "beneficiary_account_number": data.get("beneficiary_account_number"),
-        "amount": data.get("amount"),
-        "currency": data.get("currency"),
-        "transaction_log": log.name,
-        "payment_details_row": payment_row.name
+        "success": True,
+
+        "payment_status":
+            "Payment Initiated",
+
+        "request_id":
+            payment_request,
+
+        "transaction_id":
+            transaction_id,
+
+        "amount":
+            amount
     }
+
+
+# ============================================================
+# UPDATE PURCHASE INVOICE PAYMENT
+# ============================================================
+
+def update_purchase_invoice_payment(
+    log,
+    payment_status,
+    response
+):
+
+    if not log.erp_document:
+
+        frappe.log_error(
+            "ERP document is missing from Bank Transaction Log.",
+            "Bank Payment Status Update"
+        )
+
+        return
+
+    purchase_invoice = frappe.get_doc(
+        "Purchase Invoice",
+        log.erp_document
+    )
+
+    payment_row = None
+
+    for row in (
+        purchase_invoice.custom_payment_details
+        or []
+    ):
+
+        if row.payment_id == log.payment_request_id:
+
+            payment_row = row
+
+            break
+
+    if not payment_row:
+
+        frappe.log_error(
+            (
+                f"Payment Details row not found for "
+                f"payment request {log.payment_request_id} "
+                f"on Purchase Invoice "
+                f"{purchase_invoice.name}."
+            ),
+            "Bank Payment Status Update"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Update payment status
+    # --------------------------------------------------------
+
+    payment_row.payment_status = payment_status
+
+    # --------------------------------------------------------
+    # Update amount
+    # --------------------------------------------------------
+
+    if response.get("amount") is not None:
+
+        payment_row.amount = flt(
+            response.get("amount")
+        )
+
+    # --------------------------------------------------------
+    # Update currency
+    # --------------------------------------------------------
+
+    if response.get("currency"):
+
+        payment_row.currency = (
+            response.get("currency")
+        )
+
+    # --------------------------------------------------------
+    # Update outstanding amount
+    # --------------------------------------------------------
+
+    completed_amount = 0
+
+    for row in (
+        purchase_invoice.custom_payment_details
+        or []
+    ):
+
+        if row.payment_status == "Completed":
+
+            completed_amount += flt(
+                row.amount
+            )
+
+    payment_row.outstanding_amount = max(
+        flt(purchase_invoice.grand_total or 0)
+        - completed_amount,
+        0
+    )
+
+    purchase_invoice.save(
+        ignore_permissions=True
+    )
